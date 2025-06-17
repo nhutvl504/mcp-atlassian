@@ -7,6 +7,7 @@ from typing import Annotated
 from fastmcp import Context, FastMCP
 from pydantic import Field
 
+from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
 from mcp_atlassian.servers.dependencies import get_confluence_fetcher
 from mcp_atlassian.utils.decorators import (
     check_write_access,
@@ -81,33 +82,54 @@ async def search(
     Returns:
         JSON string representing a list of simplified Confluence page objects.
     """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    # Check if the query is a simple search term or already a CQL query
-    if query and not any(
-        x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "currentUser()"]
-    ):
-        original_query = query
-        try:
-            query = f'siteSearch ~ "{original_query}"'
-            logger.info(
-                f"Converting simple search term to CQL using siteSearch: {query}"
-            )
+    try:
+        confluence_fetcher = await get_confluence_fetcher(ctx)
+        # Check if the query is a simple search term or already a CQL query
+        if query and not any(
+            x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "currentUser()"]
+        ):
+            original_query = query
+            try:
+                query = f'siteSearch ~ "{original_query}"'
+                logger.info(
+                    f"Converting simple search term to CQL using siteSearch: {query}"
+                )
+                pages = confluence_fetcher.search(
+                    query, limit=limit, spaces_filter=spaces_filter
+                )
+            except Exception as e:
+                logger.warning(f"siteSearch failed ('{e}'), falling back to text search.")
+                query = f'text ~ "{original_query}"'
+                logger.info(f"Falling back to text search with CQL: {query}")
+                pages = confluence_fetcher.search(
+                    query, limit=limit, spaces_filter=spaces_filter
+                )
+        else:
             pages = confluence_fetcher.search(
                 query, limit=limit, spaces_filter=spaces_filter
             )
-        except Exception as e:
-            logger.warning(f"siteSearch failed ('{e}'), falling back to text search.")
-            query = f'text ~ "{original_query}"'
-            logger.info(f"Falling back to text search with CQL: {query}")
-            pages = confluence_fetcher.search(
-                query, limit=limit, spaces_filter=spaces_filter
-            )
-    else:
-        pages = confluence_fetcher.search(
-            query, limit=limit, spaces_filter=spaces_filter
+        search_results = [page.to_simplified_dict() for page in pages]
+        return json.dumps(search_results, indent=2, ensure_ascii=False)
+    except Exception as e:
+        from mcp_atlassian.utils.errors import create_error_response, ErrorCode
+        from mcp_atlassian.exceptions import MCPAtlassianAuthenticationError
+        
+        # Determine appropriate error code
+        error_code = None
+        if isinstance(e, MCPAtlassianAuthenticationError):
+            error_code = ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS
+        
+        logger.error(f"Error during Confluence search: {e}")
+        return create_error_response(
+            exception=e,
+            context=f"searching Confluence with query '{query}'",
+            error_code=error_code,
+            details={
+                "query": query,
+                "limit": limit,
+                "spaces_filter": spaces_filter
+            }
         )
-    search_results = [page.to_simplified_dict() for page in pages]
-    return json.dumps(search_results, indent=2, ensure_ascii=False)
 
 
 @convert_empty_defaults_to_none
@@ -189,35 +211,41 @@ async def get_page(
                 page_id, convert_to_markdown=convert_to_markdown
             )
         except Exception as e:
+            from mcp_atlassian.utils.errors import create_error_response, ErrorCode
             logger.error(f"Error fetching page by ID '{page_id}': {e}")
-            return json.dumps(
-                {"error": f"Failed to retrieve page by ID '{page_id}': {e}"},
-                indent=2,
-                ensure_ascii=False,
+            return create_error_response(
+                exception=e,
+                context=f"retrieving page by ID '{page_id}'",
+                error_code=ErrorCode.NOT_FOUND_PAGE if "404" in str(e) or "not found" in str(e).lower() else None,
+                details={"page_id": page_id, "convert_to_markdown": convert_to_markdown}
             )
     elif title and space_key:
         page_object = confluence_fetcher.get_page_by_title(
             space_key, title, convert_to_markdown=convert_to_markdown
         )
         if not page_object:
-            return json.dumps(
-                {
-                    "error": f"Page with title '{title}' not found in space '{space_key}'."
-                },
-                indent=2,
-                ensure_ascii=False,
+            from mcp_atlassian.utils.errors import MCPError, ErrorCode
+            error = MCPError(
+                code=ErrorCode.NOT_FOUND_PAGE,
+                message=f"Page with title '{title}' not found in space '{space_key}'.",
+                details={"title": title, "space_key": space_key},
+                suggestion="Please verify the page title and space key. The page might have been moved or renamed."
             )
+            return error.to_json()
     else:
         raise ValueError(
             "Either 'page_id' OR both 'title' and 'space_key' must be provided."
         )
 
     if not page_object:
-        return json.dumps(
-            {"error": "Page not found with the provided identifiers."},
-            indent=2,
-            ensure_ascii=False,
+        from mcp_atlassian.utils.errors import MCPError, ErrorCode
+        error = MCPError(
+            code=ErrorCode.NOT_FOUND_PAGE,
+            message="Page not found with the provided identifiers.",
+            details={"page_id": page_id, "title": title, "space_key": space_key},
+            suggestion="Please verify the page ID, title, and space key are correct."
         )
+        return error.to_json()
 
     if include_metadata:
         result = {"metadata": page_object.to_simplified_dict()}
@@ -306,11 +334,16 @@ async def get_page_children(
             "results": child_pages,
         }
     except Exception as e:
+        from mcp_atlassian.utils.errors import create_error_response, ErrorCode
         logger.error(
             f"Error getting/processing children for page ID {parent_id}: {e}",
             exc_info=True,
         )
-        result = {"error": f"Failed to get child pages: {e}"}
+        return create_error_response(
+            exception=e,
+            context=f"getting child pages for page ID '{parent_id}'",
+            details={"parent_id": parent_id, "limit": limit, "start": start, "include_content": include_content}
+        )
 
     return json.dumps(result, indent=2, ensure_ascii=False)
 
@@ -338,10 +371,19 @@ async def get_comments(
     Returns:
         JSON string representing a list of comment objects.
     """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    comments = confluence_fetcher.get_page_comments(page_id)
-    formatted_comments = [comment.to_simplified_dict() for comment in comments]
-    return json.dumps(formatted_comments, indent=2, ensure_ascii=False)
+    try:
+        confluence_fetcher = await get_confluence_fetcher(ctx)
+        comments = confluence_fetcher.get_page_comments(page_id)
+        formatted_comments = [comment.to_simplified_dict() for comment in comments]
+        return json.dumps(formatted_comments, indent=2, ensure_ascii=False)
+    except Exception as e:
+        from mcp_atlassian.utils.errors import create_error_response, ErrorCode
+        logger.error(f"Error getting comments for page ID '{page_id}': {e}")
+        return create_error_response(
+            exception=e,
+            context=f"getting comments for page ID '{page_id}'",
+            details={"page_id": page_id}
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "read"})
@@ -367,10 +409,19 @@ async def get_labels(
     Returns:
         JSON string representing a list of label objects.
     """
-    confluence_fetcher = await get_confluence_fetcher(ctx)
-    labels = confluence_fetcher.get_page_labels(page_id)
-    formatted_labels = [label.to_simplified_dict() for label in labels]
-    return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
+    try:
+        confluence_fetcher = await get_confluence_fetcher(ctx)
+        labels = confluence_fetcher.get_page_labels(page_id)
+        formatted_labels = [label.to_simplified_dict() for label in labels]
+        return json.dumps(formatted_labels, indent=2, ensure_ascii=False)
+    except Exception as e:
+        from mcp_atlassian.utils.errors import create_error_response, ErrorCode
+        logger.error(f"Error getting labels for page ID '{page_id}': {e}")
+        return create_error_response(
+            exception=e,
+            context=f"getting labels for page ID '{page_id}'",
+            details={"page_id": page_id}
+        )
 
 
 @confluence_mcp.tool(tags={"confluence", "write"})
@@ -605,3 +656,73 @@ async def add_comment(
         }
 
     return json.dumps(response, indent=2, ensure_ascii=False)
+
+
+@confluence_mcp.tool(tags={"confluence", "read"})
+async def search_user(
+    ctx: Context,
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "Search query - a CQL query string for user search. "
+                "Examples of CQL:\n"
+                "- Basic user lookup by full name: 'user.fullname ~ \"First Last\"'\n"
+                'Note: Special identifiers need proper quoting in CQL: personal space keys (e.g., "~username"), '
+                "reserved words, numeric IDs, and identifiers with special characters."
+            )
+        ),
+    ],
+    limit: Annotated[
+        int,
+        Field(
+            description="Maximum number of results (1-50)",
+            default=10,
+            ge=1,
+            le=50,
+        ),
+    ] = 10,
+) -> str:
+    """Search Confluence users using CQL.
+
+    Args:
+        ctx: The FastMCP context.
+        query: Search query - a CQL query string for user search.
+        limit: Maximum number of results (1-50).
+
+    Returns:
+        JSON string representing a list of simplified Confluence user search result objects.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    # If the query doesn't look like CQL, wrap it as a user fullname search
+    if query and not any(
+        x in query for x in ["=", "~", ">", "<", " AND ", " OR ", "user."]
+    ):
+        # Simple search term - search by fullname
+        query = f'user.fullname ~ "{query}"'
+        logger.info(f"Converting simple search term to user CQL: {query}")
+
+    try:
+        user_results = confluence_fetcher.search_user(query, limit=limit)
+        search_results = [user.to_simplified_dict() for user in user_results]
+        return json.dumps(search_results, indent=2, ensure_ascii=False)
+    except MCPAtlassianAuthenticationError as e:
+        logger.error(f"Authentication error during user search: {e}", exc_info=False)
+        return json.dumps(
+            {
+                "error": "Authentication failed. Please check your credentials.",
+                "details": str(e),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    except Exception as e:
+        logger.error(f"Error searching users: {str(e)}")
+        return json.dumps(
+            {
+                "error": f"An unexpected error occurred while searching for users: {str(e)}"
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
