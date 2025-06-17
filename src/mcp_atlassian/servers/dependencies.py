@@ -53,13 +53,16 @@ def _create_user_config_for_fetcher(
 
     username_for_config: str | None = credentials.get("user_email_context")
 
-    logger.debug(
-        f"Creating user config for fetcher. Auth type: {auth_type}, Credentials keys: {credentials.keys()}"
-    )
+    # Map auth_type to config values
+    config_auth_type = "oauth" if auth_type == "oauth" else "token" if auth_type == "pat" else "basic"
 
+    logger.debug(
+        f"Creating user config for fetcher. Auth type: {auth_type} -> {config_auth_type}, Credentials keys: {credentials.keys()}"
+    )
+    
     common_args: dict[str, Any] = {
         "url": base_config.url,
-        "auth_type": auth_type,
+        "auth_type": config_auth_type,  # Use mapped auth_type
         "ssl_verify": base_config.ssl_verify,
         "http_proxy": base_config.http_proxy,
         "https_proxy": base_config.https_proxy,

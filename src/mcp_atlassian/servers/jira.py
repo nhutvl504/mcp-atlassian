@@ -52,32 +52,24 @@ async def get_user_profile(
         result = user.to_simplified_dict()
         response_data = {"success": True, "user": result}
     except Exception as e:
-        error_message = ""
-        log_level = logging.ERROR
+        from mcp_atlassian.utils.errors import create_error_response, ErrorCode
+        
+        # Determine appropriate error code
+        error_code = None
         if isinstance(e, ValueError) and "not found" in str(e).lower():
-            log_level = logging.WARNING
-            error_message = str(e)
+            error_code = ErrorCode.NOT_FOUND_USER
         elif isinstance(e, MCPAtlassianAuthenticationError):
-            error_message = f"Authentication/Permission Error: {str(e)}"
+            error_code = ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS
         elif isinstance(e, OSError | HTTPError):
-            error_message = f"Network or API Error: {str(e)}"
-        else:
-            error_message = (
-                "An unexpected error occurred while fetching the user profile."
-            )
-            logger.exception(
-                f"Unexpected error in get_user_profile for '{user_identifier}':"
-            )
-        error_result = {
-            "success": False,
-            "error": str(e),
-            "user_identifier": user_identifier,
-        }
-        logger.log(
-            log_level,
-            f"get_user_profile failed for '{user_identifier}': {error_message}",
+            error_code = ErrorCode.NETWORK_CONNECTION_ERROR
+        
+        logger.error(f"get_user_profile failed for '{user_identifier}': {e}")
+        return create_error_response(
+            exception=e,
+            context=f"fetching user profile for '{user_identifier}'",
+            error_code=error_code,
+            details={"user_identifier": user_identifier}
         )
-        response_data = error_result
     return json.dumps(response_data, indent=2, ensure_ascii=False)
 
 

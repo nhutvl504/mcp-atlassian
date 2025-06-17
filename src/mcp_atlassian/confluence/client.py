@@ -66,9 +66,34 @@ class ConfluenceClient:
             logger.debug(
                 f"Initializing Confluence client with Token (PAT) auth. URL: {self.config.url}, Token (masked): {mask_sensitive(str(self.config.personal_token))}"
             )
+            
+            # For Confluence DC, we need to use Bearer token in Authorization header
+            # The atlassian-python-api library sometimes "forgets" about custom headers in session
+            # So we need to use a custom HTTPAdapter to ensure Bearer token is always sent
+            from requests.adapters import HTTPAdapter
+            
+            class BearerTokenAdapter(HTTPAdapter):
+                def __init__(self, token: str, *args, **kwargs):
+                    self.token = token
+                    super().__init__(*args, **kwargs)
+                
+                def send(self, request, **kwargs):
+                    # Always ensure Bearer token is present in request headers
+                    request.headers["Authorization"] = f"Bearer {self.token}"
+                    return super().send(request, **kwargs)
+            
+            # Create session with custom adapter
+            session = Session()
+            adapter = BearerTokenAdapter(self.config.personal_token)
+            session.mount(self.config.url, adapter)
+            session.mount("https://", adapter)  # Mount for all HTTPS requests
+            session.mount("http://", adapter)   # Mount for all HTTP requests
+            
+            logger.debug(f"Session with BearerTokenAdapter created for token: ...{mask_sensitive(str(self.config.personal_token), 8)}")
+            
             self.confluence = Confluence(
                 url=self.config.url,
-                token=self.config.personal_token,
+                session=session,
                 cloud=self.config.is_cloud,
                 verify_ssl=self.config.ssl_verify,
             )
